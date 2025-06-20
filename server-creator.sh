@@ -315,7 +315,7 @@ view-distance=${distance}
 white-list=false" > server.properties
 
 echo "#!/bin/bash
-java -Xmx${mem}G -Xms${mem}G -jar server.jar nogui" > run.sh
+sudo java -Xmx${mem}G -Xms${mem}G -jar server.jar nogui" > run.sh
 
 echo "#!/bin/bash
 cd $PWD
