@@ -328,7 +328,7 @@ white-list=false" > server.properties
 
 # Create Dockerfile
 cat > Dockerfile <<EOF
-FROM openjdk:21-jdk-slim
+FROM eclipse-temurin:21-jdk-jammy
 
 RUN apt-get update && apt-get install -y wget && rm -rf /var/lib/apt/lists/*
 
