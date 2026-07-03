@@ -164,26 +164,183 @@ install_vanilla() {
 install_fabric() {
     choose_minecraft_version || return 1
 
-    # Automatically obtain the default Fabric loader version.
+    # Automatically obtain the default Fabric loader and installer versions.
     LOADER_VERSION=$(curl -s https://meta.fabricmc.net/v2/versions/loader | jq -r '.[] | select(.stable == true) | .version' | head -n 1)
-    FABRIC_INSTALLER_VERSION="1.0.1"
+    FABRIC_INSTALLER_VERSION=$(curl -s https://meta.fabricmc.net/v2/versions/installer | jq -r '[.[] | select(.stable == true)][0].version // empty')
+    [ -z "$FABRIC_INSTALLER_VERSION" ] && FABRIC_INSTALLER_VERSION="1.1.1"
     DOWNLOAD_URL="https://meta.fabricmc.net/v2/versions/loader/${MC_VERSION}/${LOADER_VERSION}/${FABRIC_INSTALLER_VERSION}/server/jar"
 
     # Store the URL for Dockerfile use
     SERVER_DOWNLOAD_URL="$DOWNLOAD_URL"
 }
 
-# Forge server installation using the same Minecraft version UI.
-install_forge() {
-    #Work in progress 
-    choose_minecraft_version || return 1
-
+# Returns success if version $1 >= $2 (natural version ordering).
+version_ge() {
+    [ "$(printf '%s\n' "$1" "$2" | sort -V | head -n 1)" == "$2" ]
 }
 
-# NeoForge server installation (update the URL as needed).
+# Map a NeoForge version to its Minecraft version.
+#   Old scheme (3 parts): 21.1.77   -> 1.21.1   (20.4.237 -> 1.20.4, 21.0.8 -> 1.21)
+#   New scheme (4 parts): 26.1.2.76 -> 26.1.2   (26.2.0.7 -> 26.2)
+neoforge_to_mc() {
+    local v="${1%%-*}"
+    v="${v%%+*}"
+    local dots="${v//[^.]/}"
+    if [ "${#dots}" -ge 3 ]; then
+        local mc="${v%.*}"
+        echo "${mc%.0}"
+    else
+        local major="${v%%.*}"
+        local rest="${v#*.}"
+        local minor="${rest%%.*}"
+        if [ "$minor" == "0" ]; then
+            echo "1.${major}"
+        else
+            echo "1.${major}.${minor}"
+        fi
+    fi
+}
+
+# Determine which Java Docker image a Minecraft version needs. Asks Mojang's
+# version metadata for the required Java version, so future Minecraft versions
+# automatically get the right Java without script updates.
+get_java_tag() {
+    local mc="$1" major="" url=""
+    url=$(curl -s https://launchermeta.mojang.com/mc/game/version_manifest.json | jq -r --arg id "$mc" '[.versions[] | select(.id == $id)][0].url // empty')
+    if [ -n "$url" ]; then
+        major=$(curl -s "$url" | jq -r '.javaVersion.majorVersion // empty')
+    fi
+    if [ -z "$major" ]; then
+        # Fallback guess for versions Mojang's manifest does not know about.
+        case "$mc" in
+            1.*)
+                local minor patch
+                minor=$(echo "$mc" | cut -d. -f2 | tr -cd '0-9')
+                patch=$(echo "$mc" | cut -d. -f3 | tr -cd '0-9')
+                [ -z "$minor" ] && minor=0
+                [ -z "$patch" ] && patch=0
+                if [ "$minor" -le 16 ]; then
+                    major=8
+                elif [ "$minor" -le 19 ] || { [ "$minor" -eq 20 ] && [ "$patch" -lt 5 ]; }; then
+                    major=17
+                else
+                    major=21
+                fi
+                ;;
+            *)
+                major=25
+                ;;
+        esac
+    fi
+    # Round up to a Java version that has an official eclipse-temurin image.
+    if [ "$major" -le 8 ]; then
+        echo "8-jdk"
+    elif [ "$major" -le 11 ]; then
+        echo "11-jdk"
+    elif [ "$major" -le 17 ]; then
+        echo "17-jdk"
+    elif [ "$major" -le 21 ]; then
+        echo "21-jdk"
+    elif [ "$major" -le 25 ]; then
+        echo "25-jdk"
+    else
+        echo "${major}-jdk"
+    fi
+}
+
+# Forge server installation. Available Minecraft and Forge versions are read
+# from the official Forge maven metadata, so new releases show up here
+# automatically without script updates.
+install_forge() {
+    FORGE_METADATA=$(curl -s https://files.minecraftforge.net/net/minecraftforge/forge/maven-metadata.json)
+    if [ -z "$FORGE_METADATA" ] || ! echo "$FORGE_METADATA" | jq -e 'type == "object"' > /dev/null 2>&1; then
+        whiptail --title "Error" --msgbox "Failed to fetch the Forge version list!" 8 50
+        return 1
+    fi
+
+    local menu_items=()
+    local mc_ver
+    while read -r mc_ver; do
+        # Forge only ships a server installer since Minecraft 1.5.2
+        version_ge "$mc_ver" "1.5.2" && menu_items+=("$mc_ver" "")
+    done < <(echo "$FORGE_METADATA" | jq -r 'keys_unsorted[]' | sort -V | tac)
+
+    MC_VERSION=$(whiptail --title "Forge - Minecraft Version" \
+        --menu "Choose a Minecraft version:" 20 60 10 "${menu_items[@]}" \
+        3>&1 1>&2 2>&3)
+    [ -z "$MC_VERSION" ] && return 1
+
+    # Mark the promoted builds so users can spot the safe choices.
+    PROMOS=$(curl -s https://files.minecraftforge.net/net/minecraftforge/forge/promotions_slim.json)
+    RECOMMENDED=$(echo "$PROMOS" | jq -r --arg k "${MC_VERSION}-recommended" '.promos[$k] // empty' 2>/dev/null)
+    LATEST=$(echo "$PROMOS" | jq -r --arg k "${MC_VERSION}-latest" '.promos[$k] // empty' 2>/dev/null)
+
+    local build_items=()
+    local build forge_num label
+    while read -r build; do
+        forge_num="${build#"${MC_VERSION}"-}"
+        label=""
+        [ -n "$LATEST" ] && [ "$forge_num" == "$LATEST" ] && label="latest"
+        [ -n "$RECOMMENDED" ] && [ "$forge_num" == "$RECOMMENDED" ] && label="${label:+$label, }recommended"
+        build_items+=("$build" "$label")
+    done < <(echo "$FORGE_METADATA" | jq -r --arg mc "$MC_VERSION" '.[$mc] | reverse | .[]')
+
+    FORGE_VERSION=$(whiptail --title "Forge Version" \
+        --menu "Choose a Forge build for ${MC_VERSION}:" 20 70 10 "${build_items[@]}" \
+        3>&1 1>&2 2>&3)
+    [ -z "$FORGE_VERSION" ] && return 1
+
+    INSTALLER_URL="https://maven.minecraftforge.net/net/minecraftforge/forge/${FORGE_VERSION}/forge-${FORGE_VERSION}-installer.jar"
+    USE_INSTALLER=true
+}
+
+# NeoForge server installation. Available versions are read from the official
+# NeoForge maven repository, so new releases show up here automatically
+# without script updates.
 install_neoforge() {
-    #Work in progress
-    choose_minecraft_version || return 1
+    NEO_VERSIONS=$(curl -s https://maven.neoforged.net/api/maven/versions/releases/net/neoforged/neoforge | jq -r '.versions[]' 2>/dev/null)
+    if [ -z "$NEO_VERSIONS" ]; then
+        # Fall back to the plain maven metadata if the API is unavailable.
+        NEO_VERSIONS=$(curl -s https://maven.neoforged.net/releases/net/neoforged/neoforge/maven-metadata.xml | sed -n 's/.*<version>\(.*\)<\/version>.*/\1/p')
+    fi
+    # Drop snapshot/alpha builds; keep stable and -beta releases.
+    NEO_VERSIONS=$(echo "$NEO_VERSIONS" | grep -v '^0\.' | grep -v '+' | grep -v -- '-alpha')
+    if [ -z "$NEO_VERSIONS" ]; then
+        whiptail --title "Error" --msgbox "Failed to fetch the NeoForge version list!" 8 50
+        return 1
+    fi
+
+    local menu_items=()
+    local mc_ver v
+    while read -r mc_ver; do
+        menu_items+=("$mc_ver" "")
+    done < <(echo "$NEO_VERSIONS" | while read -r v; do neoforge_to_mc "$v"; done | awk '!seen[$0]++' | sort -V | tac)
+
+    MC_VERSION=$(whiptail --title "NeoForge - Minecraft Version" \
+        --menu "Choose a Minecraft version:" 20 60 10 "${menu_items[@]}" \
+        3>&1 1>&2 2>&3)
+    [ -z "$MC_VERSION" ] && return 1
+
+    local build_items=()
+    local first=true
+    while read -r v; do
+        if [ "$(neoforge_to_mc "$v")" == "$MC_VERSION" ]; then
+            if [ "$first" == true ]; then
+                build_items+=("$v" "latest")
+                first=false
+            else
+                build_items+=("$v" "")
+            fi
+        fi
+    done < <(echo "$NEO_VERSIONS" | sort -V | tac)
+
+    NEOFORGE_VERSION=$(whiptail --title "NeoForge Version" \
+        --menu "Choose a NeoForge build for ${MC_VERSION}:" 20 70 10 "${build_items[@]}" \
+        3>&1 1>&2 2>&3)
+    [ -z "$NEOFORGE_VERSION" ] && return 1
+
+    INSTALLER_URL="https://maven.neoforged.net/releases/net/neoforged/neoforge/${NEOFORGE_VERSION}/neoforge-${NEOFORGE_VERSION}-installer.jar"
+    USE_INSTALLER=true
 }
 
 # Main menu for server type selection.
@@ -191,21 +348,25 @@ SERVER_TYPE=$(whiptail --title "Minecraft Server Installer" \
     --menu "Choose server type:" 15 50 4 \
     "Vanilla" "" \
     "Fabric" "" \
+    "Forge" "" \
+    "NeoForge" "" \
     3>&1 1>&2 2>&3)
 [ -z "$SERVER_TYPE" ] && exit 0
 
+USE_INSTALLER=false
+
 case $SERVER_TYPE in
     "Vanilla")
-         install_vanilla
+         install_vanilla || exit 0
          ;;
     "Fabric")
-         install_fabric
+         install_fabric || exit 0
          ;;
     "Forge")
-         install_forge
+         install_forge || exit 0
          ;;
     "NeoForge")
-         install_neoforge
+         install_neoforge || exit 0
          ;;
     *)
          whiptail --title "Error" --msgbox "Unknown server type selected" 8 50
@@ -326,9 +487,50 @@ use-native-transport=true
 view-distance=${distance}
 white-list=false" > server.properties
 
+# Pick the Java image that matches the chosen Minecraft version.
+JAVA_TAG=$(get_java_tag "$MC_VERSION")
+echo "Using Java image: eclipse-temurin:${JAVA_TAG}"
+
 # Create Dockerfile
-cat > Dockerfile <<EOF
-FROM eclipse-temurin:21-jdk-jammy
+if [ "$USE_INSTALLER" == "true" ]; then
+    # Forge/NeoForge: run the official installer inside the image and start
+    # the server through the files it generates.
+    cat > start-server.sh <<EOF
+#!/bin/sh
+cd /minecraft
+if [ -f run.sh ]; then
+    # Modern Forge/NeoForge: memory settings belong in user_jvm_args.txt
+    printf '%s\n' "-Xmx${mem}G" "-Xms${mem}G" > user_jvm_args.txt
+    exec sh run.sh nogui
+fi
+# Older Forge versions ship a launchable server jar instead of run.sh
+SERVER_JAR=\$(ls forge-*.jar 2>/dev/null | grep -v installer | head -n 1)
+exec java -Xmx${mem}G -Xms${mem}G -jar "\$SERVER_JAR" nogui
+EOF
+
+    cat > Dockerfile <<EOF
+FROM eclipse-temurin:${JAVA_TAG}
+
+RUN apt-get update && apt-get install -y wget && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /minecraft
+
+COPY eula.txt .
+COPY server.properties .
+COPY start-server.sh .
+
+RUN wget -O installer.jar "${INSTALLER_URL}" && \\
+    java -jar installer.jar --installServer && \\
+    rm -f installer.jar installer.jar.log && \\
+    chmod +x start-server.sh
+
+EXPOSE ${port}
+
+CMD ["/minecraft/start-server.sh"]
+EOF
+else
+    cat > Dockerfile <<EOF
+FROM eclipse-temurin:${JAVA_TAG}
 
 RUN apt-get update && apt-get install -y wget && rm -rf /var/lib/apt/lists/*
 
@@ -343,6 +545,7 @@ EXPOSE ${port}
 
 CMD ["java", "-Xmx${mem}G", "-Xms${mem}G", "-jar", "server.jar", "nogui"]
 EOF
+fi
 
 # Build Docker image
 echo "Building Docker image..."
@@ -383,7 +586,7 @@ sudo docker run -d \
 
 # Clean up temporary files
 echo "Cleaning up temporary files..."
-rm -f eula.txt server.properties Dockerfile
+rm -f eula.txt server.properties Dockerfile start-server.sh
 
 if [ "$start" == "true" ]; then
     echo "Minecraft server is starting in Docker container..."
