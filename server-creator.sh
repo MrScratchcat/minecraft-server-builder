@@ -1,4 +1,22 @@
 #!/bin/bash
+# This script needs bash and a real terminal for the menus. If it was started
+# with plain sh (for example: curl ... | sh) or with its input piped, re-run
+# it with bash and the terminal attached. Keep this block POSIX-compatible.
+if [ -z "$BASH_VERSION" ] || [ ! -t 0 ]; then
+    SCRIPT_TMP=$(mktemp) || exit 1
+    if [ -f "$0" ]; then
+        cat "$0" > "$SCRIPT_TMP"
+    elif ! curl -fsSL https://raw.githubusercontent.com/MrScratchcat/minecraft-server-builder/refs/heads/main/server-creator.sh -o "$SCRIPT_TMP"; then
+        echo "This script needs bash. Please download it and run: bash server-creator.sh"
+        rm -f "$SCRIPT_TMP"
+        exit 1
+    fi
+    bash "$SCRIPT_TMP" < /dev/tty
+    SCRIPT_STATUS=$?
+    rm -f "$SCRIPT_TMP"
+    exit $SCRIPT_STATUS
+fi
+
 detect_distro() {
     if [ -f /etc/os-release ]; then
         . /etc/os-release
